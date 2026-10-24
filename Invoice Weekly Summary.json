@@ -1,0 +1,148 @@
+{
+  "name": "Invoice Weekly Summary",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "weeks",
+              "triggerAtDay": [
+                1
+              ],
+              "triggerAtHour": 8
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        -96,
+        16
+      ],
+      "id": "375b49c8-5f8e-4207-a25c-15c1db7c06a5",
+      "name": "Schedule Trigger"
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "15AO0m9SIGMzGd8d0ttZ_ufFMpNxX5AhzpfIsDR5lR50",
+          "mode": "list",
+          "cachedResultName": "Invoices",
+          "cachedResultUrl": "<SHEET_URL/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "gid=0",
+          "mode": "list",
+          "cachedResultName": "invoices",
+          "cachedResultUrl": "<SHEET_URL/edit#gid=0"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        48,
+        -128
+      ],
+      "id": "6d0a5aa1-1a06-46ec-89db-76ecb4a612d0",
+      "name": "Get row(s) in sheet",
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "Rq8msaOSfFozutC5",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const rows = $input.all().map(i => i.json).filter(r => r.dedupe_key);\nconst cutoff = Date.now() - 7 * 86400000;\nconst recent = rows.filter(r => { const t = new Date(r.received_at).getTime(); return !isNaN(t) && t >= cutoff; });\nif (!recent.length) return [{ json: { summary: '📊 Weekly invoices: none processed this week.' } }];\nconst by = {};\nfor (const r of recent) {\n  const k = `${r.supplier} (${r.currency})`;\n  by[k] = by[k] || { count: 0, total: 0 };\n  by[k].count += 1;\n  by[k].total += Number(r.total) || 0;\n}\nconst lines = Object.entries(by).sort((a, b) => b[1].total - a[1].total)\n  .map(([k, v]) => `${k}: ${v.count} invoice(s), ${v.total.toFixed(2)}`);\nreturn [{ json: { summary: `📊 Weekly invoices (${recent.length})\\n` + lines.join('\\n') } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        176,
+        16
+      ],
+      "id": "e000a332-e7e7-4b20-a53e-4802879ef936",
+      "name": "Code in JavaScript"
+    },
+    {
+      "parameters": {
+        "chatId": "<YOUR_TELEGRAM_CHAT_ID>",
+        "text": "={{ $json.summary }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        400,
+        16
+      ],
+      "id": "7b1f13f0-276e-4d89-85ce-91fd31c505bb",
+      "name": "Send a text message",
+      "webhookId": "87afb357-4e7b-42c8-8584-c0a5800a6209",
+      "credentials": {
+        "telegramApi": {
+          "id": "08zqhShbkpzL5XCF",
+          "name": "Telegram account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Get row(s) in sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get row(s) in sheet": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript": {
+      "main": [
+        [
+          {
+            "node": "Send a text message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "bc42bffe-5af6-4921-a7b0-cace37e30a01",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "6202f2f4edfdbb927216832ca0a0fa4f482e314b020a20eedb465fdcc1bc8c85"
+  },
+  "nodeGroups": [],
+  "id": "A18xcYARv1c1MbHO",
+  "tags": []
+}

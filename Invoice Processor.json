@@ -1,0 +1,597 @@
+{
+  "name": "Invoice Processor",
+  "nodes": [
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "simple": false,
+        "filters": {
+          "q": "has:attachment filename:pdf"
+        },
+        "options": {
+          "downloadAttachments": true
+        }
+      },
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        -432,
+        -80
+      ],
+      "id": "0d99f0a4-bc97-49a1-b52d-5cf41a0196b3",
+      "name": "Gmail Trigger",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "4XR5eatiNMmhYMf4",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "document",
+        "modelId": {
+          "__rl": true,
+          "value": "models/gemini-2.5-flash",
+          "mode": "list",
+          "cachedResultName": "Gemini 2.5 Flash"
+        },
+        "text": "Extract data from this invoice. Return ONLY valid JSON with no markdown, using exactly this shape:\n{\"supplier\": string, \"bill_to\": string, \"invoice_number\": string, \"invoice_date\": \"YYYY-MM-DD\", \"currency\": \"3-letter ISO code\", \"line_items\": [{\"description\": string, \"quantity\": number, \"unit_price\": number, \"amount\": number}], \"subtotal\": number, \"tax\": number, \"total\": number, \"confidence\": number from 0 to 100}\nRules:\n- \"supplier\" is the party that ISSUED the invoice (the Name or From block at the top). It is never the Bill To customer. Put the Bill To customer in \"bill_to\".\n- All dates are DD-MM-YYYY: read the first number as the day and the second as the month. Output the date as YYYY-MM-DD.\n- Infer currency from symbols ($ = USD, € = EUR, £ = GBP, ₦ = NGN).\n- Use null for any field you cannot read clearly. Never guess or invent values.\n- Lower the confidence score if the image is blurry, skewed, shadowed or any digit is unclear.",
+        "inputType": "binary",
+        "binaryPropertyName": "attachment_0",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.googleGemini",
+      "typeVersion": 1.2,
+      "position": [
+        -256,
+        0
+      ],
+      "id": "75d7b6ee-14ba-4a36-b9b4-67a8d18e24a2",
+      "name": "Analyze document",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "lRGeKlxPRKTiPkg3",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "try {\n  const errors = [];    // block auto-saving, go to review\n  const warnings = [];  // saved, but flagged\n  const OWNER = 'northwind demo services';  // lowercase name of the company this inbox belongs to\n  const MODE = 'receiving';                 \n  const isBlank = v => v === null || v === undefined || (typeof v === 'string' && /^(|null|n\\/a|na|unknown|none|-)$/i.test(v.trim()));\n  const num = v => {\n    if (isBlank(v)) return null;\n    if (typeof v === 'number') return Number.isFinite(v) ? v : NaN;\n    const n = Number(String(v).replace(/[^0-9.\\-]/g, ''));\n    return Number.isFinite(n) ? n : NaN;\n  };\n  const near = (a, b, tol = 0.02) => Math.abs(a - b) <= tol;\n\n  // 1. Did the AI call itself succeed?\n  if ($json.error) errors.push('AI call failed: ' + (typeof $json.error === 'string' ? $json.error : ($json.error.message || 'unknown error')));\n  const fr = $json.finishReason;\n  if (fr && fr !== 'STOP') errors.push('AI response incomplete or blocked (' + fr + ')');\n\n  // 2. Extract and parse JSON (tolerates fences or extra text)\n  const raw = ($json.content?.parts ?? []).map(p => p.text ?? '').join('');\n  let d = null;\n  if (!raw) { if (!$json.error) errors.push('empty AI response'); }\n  else {\n    const m = raw.replace(/```json|```/g, '').match(/\\{[\\s\\S]*\\}/);\n    try { d = JSON.parse(m ? m[0] : raw); } catch (e) { errors.push('invalid JSON from AI'); }\n  }\n  if (d && (typeof d !== 'object' || Array.isArray(d))) { errors.push('AI did not return an object'); d = null; }\n\n  let subtotal = null, tax = null, total = null;\n  if (d) {\n    // 3. Required text fields\n    for (const f of ['supplier', 'invoice_number', 'invoice_date', 'currency']) {\n      if (isBlank(d[f])) errors.push('missing ' + f);\n    }\n    if (!isBlank(d.supplier) && String(d.supplier).trim().length < 2) errors.push('supplier name too short');\n\n    // 3b. Parties swapped?\n    const sup = String(d.supplier ?? '').toLowerCase();\n    const bill = String(d.bill_to ?? '').toLowerCase();\n    if (sup && bill && sup === bill) errors.push('supplier equals bill-to');\n    if (MODE === 'receiving') {\n      if (sup.includes(OWNER)) errors.push('supplier is the owner (parties swapped?)');\n      else if (bill && !bill.includes(OWNER)) warnings.push('invoice is not addressed to ' + OWNER);\n    } else {\n      if (bill.includes(OWNER)) errors.push('bill-to is the owner (parties swapped?)');\n      else if (sup && !sup.includes(OWNER)) warnings.push('supplier is not ' + OWNER);\n    }\n\n    // 4. Numbers\n    subtotal = num(d.subtotal); tax = num(d.tax); total = num(d.total);\n    for (const [k, v] of [['subtotal', subtotal], ['tax', tax], ['total', total]]) {\n      if (Number.isNaN(v)) errors.push(k + ' is not a number');\n    }\n    if (total === null) errors.push('missing total');\n    else if (!Number.isNaN(total)) {\n      if (total === 0) errors.push('total is zero');\n      if (total < 0) warnings.push('negative total (credit note?)');\n      if (Math.abs(total) > 100000) warnings.push('unusually large total');\n    }\n    if (subtotal !== null && !Number.isNaN(subtotal) && subtotal < 0) warnings.push('negative subtotal');\n    if (tax !== null && !Number.isNaN(tax) && tax < 0) warnings.push('negative tax');\n\n    // 5. Date\n    if (!isBlank(d.invoice_date)) {\n      const ds = String(d.invoice_date);\n      const dt = /^\\d{4}-\\d{2}-\\d{2}$/.test(ds) ? new Date(ds + 'T00:00:00Z') : null;\n      if (!dt || Number.isNaN(dt.getTime()) || dt.toISOString().slice(0, 10) !== ds) errors.push('invalid date format (expected YYYY-MM-DD)');\n      else {\n        const days = (Date.now() - dt.getTime()) / 86400000;\n        if (days < -1) errors.push('invoice date is in the future');\n        if (days > 730) warnings.push('invoice is over 2 years old');\n        const [, mm, dd] = ds.split('-').map(Number);\n        if (dd <= 12 && dd !== mm) warnings.push('date could be read as day/month swapped (' + ds + ')');\n      }\n    }\n\n    // 6. Currency\n    if (!isBlank(d.currency)) {\n      const c = String(d.currency).trim();\n      if (!/^[A-Z]{3}$/.test(c)) errors.push('bad currency code');\n      else if (!['USD','EUR','GBP','NGN','CAD','AUD','CHF','JPY','CNY','INR','ZAR','KES','GHS','AED','BRL','MXN'].includes(c)) warnings.push('uncommon currency ' + c);\n    }\n\n    // 7. Invoice number sanity\n    if (!isBlank(d.invoice_number) && String(d.invoice_number).trim().length > 40) warnings.push('invoice number unusually long');\n\n    // 8. Line items\n    const items = Array.isArray(d.line_items) ? d.line_items : [];\n    if (!items.length) warnings.push('no line items extracted');\n    let sum = 0, itemsOk = items.length > 0;\n    items.forEach((it, i) => {\n      const q = num(it?.quantity), p = num(it?.unit_price), a = num(it?.amount);\n      if (a === null || Number.isNaN(a)) { errors.push(`line ${i + 1}: amount missing or not a number`); itemsOk = false; return; }\n      sum += a;\n      if (a < 0) warnings.push(`line ${i + 1}: negative amount`);\n      if (q !== null && p !== null && !Number.isNaN(q) && !Number.isNaN(p) && !near(q * p, a, Math.max(0.05, Math.abs(a) * 0.005))) {\n        errors.push(`line ${i + 1}: quantity x unit price (${(q * p).toFixed(2)}) does not equal amount (${a})`);\n      }\n      if (isBlank(it?.description)) warnings.push(`line ${i + 1}: no description`);\n    });\n    if (itemsOk && subtotal !== null && !Number.isNaN(subtotal) && !near(sum, subtotal)) errors.push(`line items sum (${sum.toFixed(2)}) does not equal subtotal (${subtotal})`);\n\n    // 9. Totals\n    const t = Number.isNaN(tax) ? null : (tax ?? 0);\n    if (total !== null && !Number.isNaN(total) && t !== null) {\n      if (subtotal !== null && !Number.isNaN(subtotal)) {\n        if (!near(subtotal + t, total)) errors.push(`subtotal + tax (${(subtotal + t).toFixed(2)}) does not equal total (${total})`);\n      } else if (itemsOk && !near(sum + t, total)) {\n        errors.push(`line items + tax (${(sum + t).toFixed(2)}) does not equal total (${total})`);\n      }\n      if (subtotal > 0 && tax !== null && tax / subtotal > 0.3) warnings.push('tax rate above 30%');\n    }\n\n    // 10. Confidence\n    const conf = num(d.confidence);\n    if (conf === null || Number.isNaN(conf)) warnings.push('no confidence score');\n    else if (conf < 80) errors.push(`low confidence (${conf})`);\n  }\n\n  const mail = (() => { try { return $('Gmail Trigger').item.json; } catch (e) { return {}; } })();\n  const key = d ? `${String(d.supplier ?? '').trim()}|${String(d.invoice_number ?? '').trim()}`.toLowerCase() : '';\n  return { json: {\n    supplier: d?.supplier ?? '',\n    bill_to: d?.bill_to ?? '',\n    invoice_number: d?.invoice_number ?? '',\n    invoice_date: d?.invoice_date ?? '',\n    currency: d?.currency ?? '',\n    subtotal, tax, total,\n    confidence: d?.confidence ?? null,\n    line_items: JSON.stringify(d?.line_items ?? []),\n    status: errors.length ? 'needs_review' : 'valid',\n    issues: errors.join('; '),\n    warnings: warnings.join('; '),\n    email_from: mail.from?.text ?? '',\n    email_subject: mail.subject ?? '',\n    received_at: mail.date ?? '',\n    dedupe_key: key\n  } };\n} catch (e) {\n  return { json: { status: 'needs_review', issues: 'validator crashed: ' + e.message, warnings: '', dedupe_key: '' } };\n}"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -32,
+        0
+      ],
+      "id": "b2ded787-7635-4fa5-97f2-075539726235",
+      "name": "Code in JavaScript"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 4
+          },
+          "conditions": [
+            {
+              "id": "d957aac4-8457-4689-86ef-81bc89cbab0e",
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "valid",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.4,
+      "position": [
+        192,
+        0
+      ],
+      "id": "39ea4ba5-327e-4c20-a800-e7710a821534",
+      "name": "If"
+    },
+    {
+      "parameters": {
+        "operation": "appendOrUpdate",
+        "documentId": {
+          "__rl": true,
+          "value": "15AO0m9SIGMzGd8d0ttZ_ufFMpNxX5AhzpfIsDR5lR50",
+          "mode": "list",
+          "cachedResultName": "Invoices",
+          "cachedResultUrl": "<SHEET_URL>/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "gid=0",
+          "mode": "list",
+          "cachedResultName": "invoices",
+          "cachedResultUrl": "<SHEET_URL>/edit#gid=0"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [
+            "dedupe_key"
+          ],
+          "schema": [
+            {
+              "id": "supplier",
+              "displayName": "supplier",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "invoice_number",
+              "displayName": "invoice_number",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "invoice_date",
+              "displayName": "invoice_date",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "currency",
+              "displayName": "currency",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "subtotal",
+              "displayName": "subtotal",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "tax",
+              "displayName": "tax",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "total",
+              "displayName": "total",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "confidence",
+              "displayName": "confidence",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "line_items",
+              "displayName": "line_items",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "issues",
+              "displayName": "issues",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "warnings",
+              "displayName": "warnings",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "email_from",
+              "displayName": "email_from",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "email_subject",
+              "displayName": "email_subject",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "received_at",
+              "displayName": "received_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "dedupe_key",
+              "displayName": "dedupe_key",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        304,
+        -128
+      ],
+      "id": "0a3e95f0-4dd9-4afa-aa17-ca3341f71592",
+      "name": "Append or update row in sheet",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "Rq8msaOSfFozutC5",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "appendOrUpdate",
+        "documentId": {
+          "__rl": true,
+          "value": "15AO0m9SIGMzGd8d0ttZ_ufFMpNxX5AhzpfIsDR5lR50",
+          "mode": "list",
+          "cachedResultName": "Invoices",
+          "cachedResultUrl": "<SHEET_URL>/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 1721205849,
+          "mode": "list",
+          "cachedResultName": "needs_review",
+          "cachedResultUrl": "<SHEET_URL>/edit#gid=1721205849"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [
+            "dedupe_key"
+          ],
+          "schema": [
+            {
+              "id": "supplier",
+              "displayName": "supplier",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "invoice_number",
+              "displayName": "invoice_number",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "invoice_date",
+              "displayName": "invoice_date",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "currency",
+              "displayName": "currency",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "subtotal",
+              "displayName": "subtotal",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "tax",
+              "displayName": "tax",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "total",
+              "displayName": "total",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "confidence",
+              "displayName": "confidence",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "line_items",
+              "displayName": "line_items",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "issues",
+              "displayName": "issues",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "warnings",
+              "displayName": "warnings",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "email_from",
+              "displayName": "email_from",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "email_subject",
+              "displayName": "email_subject",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "received_at",
+              "displayName": "received_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "dedupe_key",
+              "displayName": "dedupe_key",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        320,
+        144
+      ],
+      "id": "c1f0c18e-f48d-4ca8-aeb4-223934e3d0a4",
+      "name": "Append or update row in sheet1",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "Rq8msaOSfFozutC5",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "<YOUR_TELEGRAM_CHAT_ID>",
+        "text": "=⚠️ Invoice needs review Supplier: {{ $json.supplier }} Invoice: {{ $json.invoice_number }} Total: {{ $json.total }} {{ $json.currency }} Issues: {{ $json.issues }} From: {{ $json.email_from }}",
+        "additionalFields": {}
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        544,
+        144
+      ],
+      "id": "d34916db-209b-4620-8ab4-6bc66df44bcf",
+      "name": "Send a text message",
+      "webhookId": "a9da1f2d-65b3-4332-9eb1-d0f7845c42bc",
+      "credentials": {
+        "telegramApi": {
+          "id": "08zqhShbkpzL5XCF",
+          "name": "Telegram account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Gmail Trigger": {
+      "main": [
+        [
+          {
+            "node": "Analyze document",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Analyze document": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript": {
+      "main": [
+        [
+          {
+            "node": "If",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If": {
+      "main": [
+        [
+          {
+            "node": "Append or update row in sheet",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Append or update row in sheet1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Append or update row in sheet1": {
+      "main": [
+        [
+          {
+            "node": "Send a text message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "timeSavedMode": "fixed",
+    "errorWorkflow": "RXT5erlO1IpzuH0S",
+    "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": false
+  },
+  "versionId": "2762b01d-b984-4c10-9a1f-fc33fb91d890",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "6202f2f4edfdbb927216832ca0a0fa4f482e314b020a20eedb465fdcc1bc8c85"
+  },
+  "nodeGroups": [],
+  "id": "WJx7QqO5i2xbTymA",
+  "tags": []
+}
